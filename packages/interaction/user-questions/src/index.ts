@@ -1,15 +1,16 @@
 /**
  * Service Definition for the user-questions capability seam (`ctx.userQuestions`): a UI-backed service for
  * pausing an agent tool call until the human answers a question. The model-
- * facing tool lives in `@deepseek-ai/dsh-tool-ask-user`; UI packages provide
- * channel-addressed providers.
+ * facing tool lives in `@deepseek-ai/dsh-tool-ask-user`; UI packages compose
+ * answerers on the Agent-scoped Cordis waterfall.
  *
  * @module @deepseek-ai/dsh-user-questions
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-agent'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
+import { scopeTarget } from '@deepseek-ai/dsh-scope'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -17,7 +18,9 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-import type { AskUserQuestionAnswer, AskUserQuestionItem } from './types.ts'
+import type {
+  AskUserQuestionAnswer, AskUserQuestionRequestEvent,
+} from './types.ts'
 
 export type {
   AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionIntent, AskUserQuestionItem,
@@ -29,7 +32,7 @@ export type InteractionRoute =
   | { readonly channel: 'web'; readonly destination: string }
   | { readonly channel: 'wecom'; readonly destination: string }
 
-/** Channel names supported by the built-in interaction providers. */
+/** Channel names supported by built-in and external interaction providers. */
 export type InteractionChannel = InteractionRoute['channel']
 
 const interactionRouteRegistryKey = Symbol.for('@deepseek-ai/dsh-user-questions/interaction-route-registry')
@@ -67,7 +70,7 @@ function messageIdOf(message: object): string | undefined {
   return typeof id === 'string' && id !== '' ? id : undefined
 }
 
-/** Associate a trusted route with an immutable user message without serializing it. */
+/** Associate a trusted route with a user message without serializing it. */
 export function routeUserMessage<T extends object>(message: T, route: InteractionRoute): T {
   const registry = interactionRouteRegistry()
   const frozen = Object.freeze({ ...route })
@@ -99,18 +102,12 @@ export function interactionRouteOf(message: object | undefined): InteractionRout
 }
 
 /** Request for a human answer. */
-export interface AskUserQuestionRequest {
-  /** Questions to display. */
-  questions: AskUserQuestionItem[]
-  /** Exact live calling agent, when the request came from an agent tool call. */
-  agent?: Agent
-  /** Abort signal for the owning tool/step. */
-  signal?: AbortSignal
+export interface AskUserQuestionRequest extends AskUserQuestionRequestEvent {
   /** Host-authored route copied from the message that opened the current turn. */
   route?: InteractionRoute
 }
 
-/** UI-side provider for user questions. */
+/** Direct channel provider used by out-of-tree interaction plugins. */
 export interface UserQuestionProvider {
   ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer>
 }
@@ -123,12 +120,35 @@ export class UserQuestionError extends HarnessError {
   }
 }
 
+function abortedQuestion(cause?: unknown): UserQuestionError {
+  return new UserQuestionError(
+    'ask_user_question was aborted before the user answered',
+    'ASK_ABORTED',
+    cause === undefined ? undefined : { cause },
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function restoreUserQuestionError(reason: unknown): unknown {
+  if (reason instanceof UserQuestionError) return reason
+  if (isRecord(reason)
+    && reason.name === 'UserQuestionError'
+    && typeof reason.message === 'string'
+    && typeof reason.code === 'string') {
+    return new UserQuestionError(reason.message, reason.code, { cause: reason })
+  }
+  return reason
+}
+
 interface ProviderRegistration {
   provider: UserQuestionProvider
   disposed: AbortController
 }
 
-/** `ctx.userQuestions`: channel providers plus a route-aware `ask()` API. */
+/** `ctx.userQuestions`: validation, explicit routes, and the scoped answerer waterfall. */
 export class UserQuestionService extends Service {
   /** Feature probe used by optional out-of-tree providers. */
   readonly supportsRouting: true = true
@@ -141,16 +161,16 @@ export class UserQuestionService extends Service {
   /**
    * Register the legacy/default Web provider.
    *
-   * @param provider UI-side implementation that collects answers.
-   * @returns Disposer that unregisters this provider.
+   * @param provider Direct provider that collects the answer.
+   * @returns A disposer that unregisters the provider.
    */
   registerProvider(provider: UserQuestionProvider): () => void
   /**
-   * Register one channel provider.
+   * Register a provider for one explicit route channel.
    *
-   * @param channel Trusted route channel owned by this provider.
-   * @param provider UI-side implementation that collects answers.
-   * @returns Disposer that unregisters this provider and aborts its pending asks.
+   * @param channel Trusted route channel owned by the provider.
+   * @param provider Direct provider that collects the answer.
+   * @returns A disposer that unregisters the provider and aborts pending asks.
    */
   registerProvider(channel: InteractionChannel, provider: UserQuestionProvider): () => void
   registerProvider(
@@ -175,7 +195,7 @@ export class UserQuestionService extends Service {
         this.providers.delete(channel)
         registration.disposed.abort()
       }
-    }.bind(this), 'userInteraction.registerProvider()')
+    }.bind(this), 'userQuestions.registerProvider()')
     return () => void dispose()
   }
 
@@ -183,11 +203,10 @@ export class UserQuestionService extends Service {
     registration: ProviderRegistration,
     request: AskUserQuestionRequest,
   ): Promise<AskUserQuestionAnswer> {
-    const callerSignal = request.signal
     const providerSignal = registration.disposed.signal
-    const signal = callerSignal === undefined
+    const signal = request.signal === undefined
       ? providerSignal
-      : AbortSignal.any([callerSignal, providerSignal])
+      : AbortSignal.any([request.signal, providerSignal])
     return new Promise<AskUserQuestionAnswer>((resolve, reject) => {
       let settled = false
       const finish = (operation: () => void): void => {
@@ -196,35 +215,25 @@ export class UserQuestionService extends Service {
         signal.removeEventListener('abort', onAbort)
         operation()
       }
-      const onAbort = (): void => {
-        finish(() => {
-          reject(providerSignal.aborted
-            ? new UserQuestionError('the selected user-questions provider was disposed', 'PROVIDER_DISPOSED')
-            : new UserQuestionError('ask_user_question was aborted before the user answered', 'ASK_ABORTED'))
-        })
-      }
+      const onAbort = (): void => finish(() => reject(providerSignal.aborted
+        ? new UserQuestionError('the selected user-questions provider was disposed', 'PROVIDER_DISPOSED')
+        : abortedQuestion()))
       signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) {
+        onAbort()
+        return
+      }
       Promise.resolve()
         .then(() => registration.provider.ask({ ...request, signal }))
         .then(
-          (answer) => {
-            finish(() => {
-              resolve(answer)
-            })
-          },
-          (error: unknown) => {
-            finish(() => {
-              reject(error instanceof Error
-                ? error
-                : new UserQuestionError('the selected user-questions provider failed', 'PROVIDER_FAILED', { cause: error }))
-            })
-          },
+          answer => finish(() => resolve(answer)),
+          error => finish(() => reject(restoreUserQuestionError(error))),
         )
     })
   }
 
   /**
-   * Ask the provider selected by the trusted route and wait for the user's answer.
+   * Ask the scoped answerer waterfall and wait for the user's answer.
    *
    * When a caller supplies an agent, human interaction is valid only for the
    * exact live runtime root. Runtime ownership, not durable session lineage,
@@ -234,13 +243,14 @@ export class UserQuestionService extends Service {
    *
    * @param request Questions, owner agent, and abort signal.
    * @returns The answer chosen or typed by the human.
-   * @throws {UserQuestionError} code `CALLER_NOT_LIVE` when a supplied
-   *   agent is not the registry's exact live instance, or `DELEGATED_CALLER`
-   *   when that live agent is owned by another agent.
+   * @throws {UserQuestionError} code `ASK_ABORTED` when the supplied signal
+   *   is already or becomes aborted, `CALLER_NOT_LIVE` when a supplied agent
+   *   is not the registry's exact live instance, or `DELEGATED_CALLER` when
+   *   that live agent is owned by another agent.
    */
   async ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> {
     if (request.signal?.aborted) {
-      throw new UserQuestionError('ask_user_question was aborted before the user answered', 'ASK_ABORTED')
+      throw abortedQuestion()
     }
     if (request.questions.length === 0) {
       throw new UserQuestionError('ask_user_question requires at least one question', 'EMPTY_QUESTIONS')
@@ -282,17 +292,37 @@ export class UserQuestionService extends Service {
           'BAD_INTENT')
       }
     }
-    const channel = request.route?.channel ?? 'web'
-    const registration = this.providers.get(channel)
-    if (registration === undefined) {
-      if (request.route !== undefined) {
+    const noAnswerer = () => Promise.reject(new UserQuestionError(
+      'no user-questions answerer accepted the request',
+      'NO_PROVIDER',
+    ))
+    try {
+      const route = request.route
+      const directProvider = this.providers.get(route?.channel ?? 'web')
+      if (directProvider !== undefined) {
+        return await this.askProvider(directProvider, request)
+      }
+      if (route !== undefined && route.channel !== 'web') {
         throw new UserQuestionError(
-          `no user-questions provider is registered for route ${channel}`,
+          `no user-questions provider is registered for route ${route.channel}`,
           'NO_PROVIDER_FOR_ROUTE')
       }
-      throw new UserQuestionError('no default Web user-questions provider is registered', 'NO_PROVIDER')
+      return await (agent === undefined
+        ? this.ctx.waterfall('user-questions/request', request, noAnswerer)
+        : this.ctx.waterfall(
+          scopeTarget(agent, agent),
+          'user-questions/request',
+          { ...request, agent },
+          noAnswerer,
+        ))
+    } catch (error) {
+      const restored = restoreUserQuestionError(error)
+      if (restored instanceof UserQuestionError) throw restored
+      if (request.signal?.aborted) {
+        throw abortedQuestion(error)
+      }
+      throw restored
     }
-    return this.askProvider(registration, request)
   }
 }
 

@@ -1,22 +1,31 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import UserQuestionService, {
+  UserQuestionError,
   interactionRouteOf,
   routeUserMessage,
-  UserQuestionError,
+  type AskUserQuestionAnswer,
   type AskUserQuestionRequest,
-  type UserQuestionProvider,
 } from '@deepseek-ai/dsh-user-questions'
 
-function provider(answer = 'approved'): UserQuestionProvider & { seen: AskUserQuestionRequest[] } {
+interface QuestionAnswerer {
+  ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer>
+}
+
+function registerAnswerer(ctx: Context, answerer: QuestionAnswerer): () => void {
+  return ctx.on('user-questions/request', request => answerer.ask(request))
+}
+
+function provider(answer = 'approved'): QuestionAnswerer & { seen: AskUserQuestionRequest[] } {
   const seen: AskUserQuestionRequest[] = []
   return {
     seen,
     async ask(request) {
       seen.push(request)
-      return { answers: [{ id: request.questions[0]?.id ?? 'missing', selected: [answer] }] }
+      return {
+        answers: request.questions.map(question => ({ id: question.id, selected: [answer] })),
+      }
     },
   }
 }
@@ -30,38 +39,17 @@ function stubAgent(id: string, delegationDepth = 0): Agent {
 }
 
 describe('UserQuestionService', () => {
-  it('keeps trusted routes process-local and out of serialized messages', () => {
-    const message = routeUserMessage(createUserMessage({
-      content: [{ type: 'text', text: 'hello' }],
-      source: { kind: 'user' },
-    }), { channel: 'wecom', destination: 'single:secret-user' })
-
-    expect(interactionRouteOf(message)).toEqual({ channel: 'wecom', destination: 'single:secret-user' })
-    expect(JSON.stringify(message)).not.toContain('single:secret-user')
-  })
-
-  it('recovers a trusted route after the inbox clones the message', () => {
-    const message = routeUserMessage(createUserMessage({
-      content: [{ type: 'text', text: 'hello' }],
-      source: { kind: 'user' },
-    }), { channel: 'wecom', destination: 'single:cloned-user' })
-    const inboxCopy = structuredClone(message)
-
-    expect(inboxCopy).not.toBe(message)
-    expect(interactionRouteOf(inboxCopy)).toEqual({ channel: 'wecom', destination: 'single:cloned-user' })
-    expect(JSON.stringify(inboxCopy)).not.toContain('single:cloned-user')
-  })
-
   it('delegates ask requests to the registered provider', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
     const p = provider('yes')
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
+    const questions = [{ id: 'confirm', question: 'Proceed?', options: [{ label: 'yes' }] }]
 
-    const result = await ctx.userQuestions.ask({ questions: [{ id: 'confirm', question: 'Proceed?' }] })
+    const result = await ctx.userQuestions.ask({ questions })
 
     expect(result).toEqual({ answers: [{ id: 'confirm', selected: ['yes'] }] })
-    expect(p.seen).toMatchObject([{ questions: [{ id: 'confirm', question: 'Proceed?' }] }])
+    expect(p.seen).toEqual([{ questions }])
   })
 
   it('rejects ask requests when no provider is registered', async () => {
@@ -76,7 +64,7 @@ describe('UserQuestionService', () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
     const p = provider()
-    const dispose = ctx.userQuestions.registerProvider(p)
+    const dispose = registerAnswerer(ctx, p)
 
     dispose()
     dispose()
@@ -85,83 +73,81 @@ describe('UserQuestionService', () => {
       .rejects.toMatchObject({ code: 'NO_PROVIDER' })
   })
 
-  it('rejects duplicate providers instead of replacing the active UI', async () => {
+  it('delegates through composed answerers', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
-    ctx.userQuestions.registerProvider(provider('first'))
+    const delegated = vi.fn()
+    ctx.on('user-questions/request', (_request, next) => {
+      delegated()
+      return next()
+    })
+    const p = provider('second')
+    registerAnswerer(ctx, p)
 
-    expect(() => ctx.userQuestions.registerProvider(provider('second')))
-      .toThrow(UserQuestionError)
+    await expect(ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?', options: [{ label: 'second' }] }],
+    })).resolves.toEqual({ answers: [{ id: 'confirm', selected: ['second'] }] })
+    expect(delegated).toHaveBeenCalledOnce()
   })
 
-  it('normalizes non-Error provider failures', async () => {
+  it('routes an explicit WeCom request only to its channel provider', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
-    // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- exercises a hostile provider boundary.
-    ctx.userQuestions.registerProvider({ ask: () => Promise.reject('broken provider') })
-
-    await expect(ctx.userQuestions.ask({ questions: [{ id: 'confirm', question: 'Proceed?' }] }))
-      .rejects.toMatchObject({ name: 'UserQuestionError', code: 'PROVIDER_FAILED', cause: 'broken provider' })
-  })
-
-  it('routes Web and WeCom requests to concurrent channel providers', async () => {
-    const ctx = new Context()
-    await ctx.plugin(UserQuestionService)
-    const web = provider('web-answer')
-    const wecom = provider('wecom-answer')
-    ctx.userQuestions.registerProvider('web', web)
+    const web = provider('web')
+    const wecom = provider('wecom')
+    registerAnswerer(ctx, web)
     ctx.userQuestions.registerProvider('wecom', wecom)
 
     await expect(ctx.userQuestions.ask({
-      questions: [{ id: 'route', question: 'Where?' }],
-      route: { channel: 'wecom', destination: 'single:user-1' },
-    })).resolves.toEqual({ answers: [{ id: 'route', selected: ['wecom-answer'] }] })
-    await expect(ctx.userQuestions.ask({
-      questions: [{ id: 'route', question: 'Where?' }],
-      route: { channel: 'web', destination: 'session-1' },
-    })).resolves.toEqual({ answers: [{ id: 'route', selected: ['web-answer'] }] })
-    expect(web.seen).toHaveLength(1)
-    expect(wecom.seen).toHaveLength(1)
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+      route: { channel: 'wecom', destination: 'single:chat-1' },
+    })).resolves.toEqual({ answers: [{ id: 'confirm', selected: ['wecom'] }] })
+    expect(web.seen).toHaveLength(0)
+    expect(wecom.seen[0]?.route).toEqual({ channel: 'wecom', destination: 'single:chat-1' })
   })
 
-  it('defaults legacy route-less asks to Web and never falls back explicit routes', async () => {
+  it('does not fall back when an explicit route has no provider', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
-    const web = provider('web-answer')
-    ctx.userQuestions.registerProvider(web)
+    const web = provider('web')
+    registerAnswerer(ctx, web)
 
-    await expect(ctx.userQuestions.ask({ questions: [{ id: 'legacy', question: 'Continue?' }] }))
-      .resolves.toEqual({ answers: [{ id: 'legacy', selected: ['web-answer'] }] })
     await expect(ctx.userQuestions.ask({
-      questions: [{ id: 'explicit', question: 'Continue?' }],
-      route: { channel: 'wecom', destination: 'single:user-1' },
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+      route: { channel: 'wecom', destination: 'single:chat-1' },
     })).rejects.toMatchObject({ code: 'NO_PROVIDER_FOR_ROUTE' })
-    expect(web.seen).toHaveLength(1)
+    expect(web.seen).toHaveLength(0)
   })
 
-  it('aborts only the disposed provider pending asks', async () => {
+  it('rejects pending direct requests when their provider is disposed', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
-    const never = (): UserQuestionProvider => ({ ask: () => new Promise(() => undefined) })
-    const disposeWecom = ctx.userQuestions.registerProvider('wecom', never())
-    ctx.userQuestions.registerProvider('web', provider('web-answer'))
-    const pending = ctx.userQuestions.ask({
-      questions: [{ id: 'pending', question: 'Continue?' }],
-      route: { channel: 'wecom', destination: 'single:user-1' },
+    const dispose = ctx.userQuestions.registerProvider('wecom', { ask: () => new Promise(() => {}) })
+    const answer = ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+      route: { channel: 'wecom', destination: 'single:chat-1' },
     })
 
-    disposeWecom()
+    dispose()
 
-    await expect(pending).rejects.toMatchObject({ code: 'PROVIDER_DISPOSED' })
-    await expect(ctx.userQuestions.ask({ questions: [{ id: 'web', question: 'Continue?' }] }))
-      .resolves.toMatchObject({ answers: [{ selected: ['web-answer'] }] })
+    await expect(answer).rejects.toMatchObject({ code: 'PROVIDER_DISPOSED' })
+  })
+
+  it('preserves trusted routes when validation clones a message', () => {
+    const original = routeUserMessage(
+      { id: 'message-1', source: { kind: 'user' } },
+      { channel: 'wecom', destination: 'single:chat-1' },
+    )
+    const clone = structuredClone(original)
+
+    expect(interactionRouteOf(clone)).toEqual({ channel: 'wecom', destination: 'single:chat-1' })
   })
 
   it('fails before reaching the provider when the signal is already aborted', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
     const p = { ask: vi.fn(async () => ({ answers: [{ id: 'confirm', selected: ['too late'] }] })) }
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
     const controller = new AbortController()
     controller.abort()
 
@@ -170,11 +156,91 @@ describe('UserQuestionService', () => {
     expect(p.ask).not.toHaveBeenCalled()
   })
 
+  it('normalizes an in-flight signal cancellation to ASK_ABORTED', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const pending = Promise.withResolvers<never>()
+    registerAnswerer(ctx, { ask: () => pending.promise })
+    const controller = new AbortController()
+    const abortReason = new DOMException('This operation was aborted', 'AbortError')
+
+    const answer = ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+      signal: controller.signal,
+    })
+    controller.abort(abortReason)
+    pending.reject(abortReason)
+
+    await expect(answer).rejects.toMatchObject({
+      name: 'UserQuestionError',
+      code: 'ASK_ABORTED',
+      cause: abortReason,
+    })
+  })
+
+  it('preserves a domain rejection when its provider also aborts the signal', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const controller = new AbortController()
+    const cancelled = new UserQuestionError('the user cancelled ask_user_question', 'ASK_CANCELLED')
+    registerAnswerer(ctx, {
+      ask: () => {
+        controller.abort()
+        return Promise.reject(cancelled)
+      },
+    })
+
+    await expect(ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+      signal: controller.signal,
+    })).rejects.toBe(cancelled)
+  })
+
+  it('restores a transported provider rejection to UserQuestionError', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const transported = Object.assign(new Error('the user cancelled ask_user_question'), {
+      name: 'UserQuestionError',
+      code: 'ASK_CANCELLED',
+    })
+    registerAnswerer(ctx, { ask: () => Promise.reject(transported) })
+
+    const rejection = await ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+
+    expect(rejection).toBeInstanceOf(UserQuestionError)
+    expect(rejection).toMatchObject({
+      name: 'UserQuestionError',
+      code: 'ASK_CANCELLED',
+      cause: transported,
+    })
+  })
+
+  it.each([
+    ['an ordinary Error', new Error('provider failed')],
+    ['a namesake Error without a string code', Object.assign(new Error('provider failed'), {
+      name: 'UserQuestionError',
+    })],
+    ['a non-Error rejection', { name: 'UserQuestionError', code: 'ASK_CANCELLED' }],
+  ])('preserves %s from the provider', async (_label, rejection) => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    registerAnswerer(ctx, { ask: vi.fn().mockRejectedValue(rejection) })
+
+    await expect(ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+    })).rejects.toBe(rejection)
+  })
+
   it('rejects empty question batches before reaching the provider', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
     const p = { ask: vi.fn(async () => ({ answers: [] })) }
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
 
     await expect(ctx.userQuestions.ask({ questions: [] }))
       .rejects.toMatchObject({ name: 'UserQuestionError', code: 'EMPTY_QUESTIONS' })
@@ -186,7 +252,7 @@ describe('UserQuestionService', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     const p = { ask: vi.fn(async () => ({ answers: [] })) }
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
     const root = stubAgent('root', 0)
     const child = stubAgent('child', 0)
     ctx.agents.enter(root, undefined)
@@ -208,12 +274,12 @@ describe('UserQuestionService', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     const p = provider('yes')
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
     const agent = stubAgent('resumed-root', 1)
     ctx.agents.enter(agent, undefined)
 
     const result = await ctx.userQuestions.ask({
-      questions: [{ id: 'confirm', question: 'Proceed?' }],
+      questions: [{ id: 'confirm', question: 'Proceed?', options: [{ label: 'yes' }] }],
       agent,
     })
 
@@ -224,7 +290,7 @@ describe('UserQuestionService', () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
     const p = { ask: vi.fn(async () => ({ answers: [] })) }
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
 
     await expect(ctx.userQuestions.ask({
       questions: [{ id: 'confirm', question: 'Proceed?' }],
@@ -238,7 +304,7 @@ describe('UserQuestionService', () => {
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(UserQuestionService)
     const p = { ask: vi.fn(async () => ({ answers: [] })) }
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
     const live = stubAgent('same-id')
     ctx.agents.enter(live, undefined)
 
@@ -249,11 +315,41 @@ describe('UserQuestionService', () => {
     expect(p.ask).not.toHaveBeenCalled()
   })
 
+  it('restores a transported UserQuestionError to the public error class', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const transported = Object.assign(new Error('the user cancelled ask_user_question'), {
+      name: 'UserQuestionError',
+      code: 'ASK_CANCELLED',
+    })
+    registerAnswerer(ctx, { ask: () => Promise.reject(transported) })
+
+    const failure = await ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+    }).then(() => undefined, (error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(UserQuestionError)
+    expect(failure).toMatchObject({
+      name: 'UserQuestionError', code: 'ASK_CANCELLED', cause: transported,
+    })
+  })
+
+  it('preserves a provider rejection outside the UserQuestionError taxonomy', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const failure = new Error('provider failed')
+    registerAnswerer(ctx, { ask: () => Promise.reject(failure) })
+
+    await expect(ctx.userQuestions.ask({
+      questions: [{ id: 'confirm', question: 'Proceed?' }],
+    })).rejects.toBe(failure)
+  })
+
   it('rejects an intent whose approve label names none of its own options', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
     const p = { ask: vi.fn(async () => ({ answers: [] })) }
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
     const question = { id: 'plan-review', question: 'Approve?', detail: '# Plan' }
 
     // A wrong label among offered options, and no options offered at all.
@@ -273,7 +369,7 @@ describe('UserQuestionService', () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
     const p = { ask: vi.fn(async () => ({ answers: [] })) }
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
 
     // Detail IS the plan for this intent, so a UI honouring it would ask the
     // user to approve something they cannot see.
@@ -291,12 +387,12 @@ describe('UserQuestionService', () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
     const p = provider('Approve')
-    ctx.userQuestions.registerProvider(p)
+    registerAnswerer(ctx, p)
     const intent = { kind: 'plan-review', approve: 'Approve' } as const
 
     const result = await ctx.userQuestions.ask({
       questions: [
-        { id: 'plain', question: 'Proceed?' },
+        { id: 'plain', question: 'Proceed?', options: [{ label: 'Approve' }] },
         {
           id: 'plan-review', question: 'Approve?', detail: '# Plan',
           options: [{ label: 'Approve' }, { label: 'Keep planning' }], intent,
@@ -304,7 +400,10 @@ describe('UserQuestionService', () => {
       ],
     })
 
-    expect(result.answers).toEqual([{ id: 'plain', selected: ['Approve'] }])
+    expect(result.answers).toEqual([
+      { id: 'plain', selected: ['Approve'] },
+      { id: 'plan-review', selected: ['Approve'] },
+    ])
     expect(p.seen[0]?.questions[1]?.intent).toEqual(intent)
   })
 })

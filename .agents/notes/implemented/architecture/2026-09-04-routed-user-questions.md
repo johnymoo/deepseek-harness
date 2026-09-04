@@ -6,15 +6,15 @@ English | [中文](2026-09-04-routed-user-questions.zh.md)
 
 ## Problem
 
-`ctx.userQuestions` previously allowed one provider for the whole process. A Web host and another trusted interaction channel could not both answer questions, even when successive turns used the same session. Selecting a provider from agent or session identity was insufficient because those identities do not identify which channel opened the current turn.
+`ctx.userQuestions` previously had no way for an out-of-tree interaction channel to claim only the turns it originated. Selecting an answerer from agent or session identity was insufficient because those identities do not identify which channel opened the current turn.
 
 ## Decision
 
-The service registers providers by `web` or `wecom` channel. The legacy one-argument registration remains the default Web registration. A host records an `InteractionRoute` in a shared process-local registry under both the opening user-message object and its generated message id. The bounded id index preserves the route when durable inbox validation clones the message; the WeakMap keeps the direct-object path cheap. `ask_user_question` captures the route at the first pre-step and copies the frozen value into the internal request. The route is absent from JSON persistence, wire history, and the model tool schema and arguments.
+The service keeps the upstream Agent-scoped waterfall for Web and route-less requests, and adds direct providers for explicit `web` or `wecom` routes. The legacy one-argument registration remains the default Web registration. A host records an `InteractionRoute` in a shared process-local registry under both the opening user-message object and its generated message id. The bounded id index preserves the route when durable inbox validation clones the message; the WeakMap keeps the direct-object path cheap. `ask_user_question` captures the route at the first pre-step and copies the frozen value into the internal request. The route is absent from JSON persistence, wire history, and the model tool schema and arguments.
 
-Route-less requests select Web for compatibility. An explicit route selects only its named channel and fails with `NO_PROVIDER_FOR_ROUTE` when that channel is unavailable. Registration disposal aborts pending work for that provider without affecting other channels.
+Route-less and explicit Web requests use the scoped waterfall unless a legacy direct Web provider is registered. An explicit non-Web route selects only its named channel and fails with `NO_PROVIDER_FOR_ROUTE` when that channel is unavailable. Registration disposal aborts pending work for that provider without affecting other channels.
 
-Providers authenticate the route destination against their own trusted state. The Web provider requires the destination to equal the exact live session. Channel-specific providers remain responsible for sender, transport correlation, and response ownership.
+Direct providers authenticate the route destination against their own trusted state. Channel-specific providers remain responsible for sender, transport correlation, and response ownership.
 
 ## Alternatives considered
 
@@ -26,8 +26,8 @@ Providers authenticate the route destination against their own trusted state. Th
 
 ## Consequences
 
-Web and WeCom providers can coexist, and each turn keeps the route chosen by its trusted ingress even if later steering arrives from another source. The route exists only for the live turn and is deliberately absent after resume. New channels require extending the closed built-in route union. Providers receive a service-owned abort signal so channel disposal reaches pending asks; callers must use signal behavior rather than signal object identity.
+The scoped Web answerer and WeCom provider can coexist, and each turn keeps the route chosen by its trusted ingress even if later steering arrives from another source. The route exists only for the live turn and is deliberately absent after resume. New channels require extending the closed built-in route union. Direct providers receive a service-owned abort signal so channel disposal reaches pending asks; callers must use signal behavior rather than signal object identity.
 
 ## Testing
 
-User-question service tests cover concurrent providers, legacy Web defaulting, explicit no-fallback errors, duplicate registration, provider-scoped disposal, and route recovery from a cloned inbox message. Tool tests prove the opening message wins over a later differently routed message. ApiProxy tests reject a Web destination that differs from the exact calling session.
+User-question service tests cover the scoped Web answerer alongside a direct WeCom provider, explicit no-fallback errors, provider-scoped disposal, and route recovery from a cloned inbox message. Tool tests prove the opening message wins over a later differently routed message.
