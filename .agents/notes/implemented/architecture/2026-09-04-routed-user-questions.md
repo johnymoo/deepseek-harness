@@ -10,7 +10,7 @@ English | [中文](2026-09-04-routed-user-questions.zh.md)
 
 ## Decision
 
-The service registers providers by `web` or `wecom` channel. The legacy one-argument registration remains the default Web registration. A host writes an `InteractionRoute` under a shared process-local Symbol on the user message that opens a turn. `ask_user_question` captures it at the first pre-step and copies the frozen route into the internal request. The Symbol is absent from JSON persistence, wire history, and the model tool schema and arguments.
+The service registers providers by `web` or `wecom` channel. The legacy one-argument registration remains the default Web registration. A host records an `InteractionRoute` in a shared process-local registry under both the opening user-message object and its generated message id. The bounded id index preserves the route when durable inbox validation clones the message; the WeakMap keeps the direct-object path cheap. `ask_user_question` captures the route at the first pre-step and copies the frozen value into the internal request. The route is absent from JSON persistence, wire history, and the model tool schema and arguments.
 
 Route-less requests select Web for compatibility. An explicit route selects only its named channel and fails with `NO_PROVIDER_FOR_ROUTE` when that channel is unavailable. Registration disposal aborts pending work for that provider without affecting other channels.
 
@@ -30,4 +30,4 @@ Web and WeCom providers can coexist, and each turn keeps the route chosen by its
 
 ## Testing
 
-User-question service tests cover concurrent providers, legacy Web defaulting, explicit no-fallback errors, duplicate registration, and provider-scoped disposal. Tool tests prove the opening message wins over a later differently routed message. ApiProxy tests reject a Web destination that differs from the exact calling session.
+User-question service tests cover concurrent providers, legacy Web defaulting, explicit no-fallback errors, duplicate registration, provider-scoped disposal, and route recovery from a cloned inbox message. Tool tests prove the opening message wins over a later differently routed message. ApiProxy tests reject a Web destination that differs from the exact calling session.

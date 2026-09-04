@@ -40,6 +40,18 @@ describe('UserQuestionService', () => {
     expect(JSON.stringify(message)).not.toContain('single:secret-user')
   })
 
+  it('recovers a trusted route after the inbox clones the message', () => {
+    const message = routeUserMessage(createUserMessage({
+      content: [{ type: 'text', text: 'hello' }],
+      source: { kind: 'user' },
+    }), { channel: 'wecom', destination: 'single:cloned-user' })
+    const inboxCopy = structuredClone(message)
+
+    expect(inboxCopy).not.toBe(message)
+    expect(interactionRouteOf(inboxCopy)).toEqual({ channel: 'wecom', destination: 'single:cloned-user' })
+    expect(JSON.stringify(inboxCopy)).not.toContain('single:cloned-user')
+  })
+
   it('delegates ask requests to the registered provider', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
