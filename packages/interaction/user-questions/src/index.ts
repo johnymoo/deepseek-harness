@@ -2,7 +2,7 @@
  * Service Definition for the user-questions capability seam (`ctx.userQuestions`): a UI-backed service for
  * pausing an agent tool call until the human answers a question. The model-
  * facing tool lives in `@deepseek-ai/dsh-tool-ask-user`; UI packages provide
- * the single active provider.
+ * channel-addressed providers.
  *
  * @module @deepseek-ai/dsh-user-questions
  */
@@ -24,6 +24,35 @@ export type {
   AskUserQuestionOption,
 } from './types.ts'
 
+/** Trusted destination selected by the host that started the current turn. */
+export type InteractionRoute =
+  | { readonly channel: 'web'; readonly destination: string }
+  | { readonly channel: 'wecom'; readonly destination: string }
+
+/** Channel names supported by the built-in interaction providers. */
+export type InteractionChannel = InteractionRoute['channel']
+
+const interactionRouteRegistryKey = Symbol.for('@deepseek-ai/dsh-user-questions/interaction-route-registry')
+
+function interactionRouteRegistry(): WeakMap<object, InteractionRoute> {
+  const existing: unknown = Reflect.get(globalThis, interactionRouteRegistryKey)
+  if (existing instanceof WeakMap) return existing as WeakMap<object, InteractionRoute>
+  const registry = new WeakMap<object, InteractionRoute>()
+  Reflect.set(globalThis, interactionRouteRegistryKey, registry)
+  return registry
+}
+
+/** Associate a trusted route with an immutable user message without serializing it. */
+export function routeUserMessage<T extends object>(message: T, route: InteractionRoute): T {
+  interactionRouteRegistry().set(message, Object.freeze({ ...route }))
+  return message
+}
+
+/** Read the process-local trusted route associated with a user message. */
+export function interactionRouteOf(message: object | undefined): InteractionRoute | undefined {
+  return message === undefined ? undefined : interactionRouteRegistry().get(message)
+}
+
 /** Request for a human answer. */
 export interface AskUserQuestionRequest {
   /** Questions to display. */
@@ -32,6 +61,8 @@ export interface AskUserQuestionRequest {
   agent?: Agent
   /** Abort signal for the owning tool/step. */
   signal?: AbortSignal
+  /** Host-authored route copied from the message that opened the current turn. */
+  route?: InteractionRoute
 }
 
 /** UI-side provider for user questions. */
@@ -47,35 +78,108 @@ export class UserQuestionError extends HarnessError {
   }
 }
 
-/** `ctx.userQuestions`: one active UI provider plus an `ask()` API. */
+interface ProviderRegistration {
+  provider: UserQuestionProvider
+  disposed: AbortController
+}
+
+/** `ctx.userQuestions`: channel providers plus a route-aware `ask()` API. */
 export class UserQuestionService extends Service {
-  private provider: UserQuestionProvider | undefined
+  /** Feature probe used by optional out-of-tree providers. */
+  readonly supportsRouting: true = true
+  private readonly providers = new Map<InteractionChannel, ProviderRegistration>()
 
   constructor(ctx: Context) {
     super(ctx, 'userQuestions')
   }
 
   /**
-   * Register the UI provider. Only one provider may be active in a context.
+   * Register the legacy/default Web provider.
    *
    * @param provider UI-side implementation that collects answers.
    * @returns Disposer that unregisters this provider.
    */
-  registerProvider(provider: UserQuestionProvider): () => void {
+  registerProvider(provider: UserQuestionProvider): () => void
+  /**
+   * Register one channel provider.
+   *
+   * @param channel Trusted route channel owned by this provider.
+   * @param provider UI-side implementation that collects answers.
+   * @returns Disposer that unregisters this provider and aborts its pending asks.
+   */
+  registerProvider(channel: InteractionChannel, provider: UserQuestionProvider): () => void
+  registerProvider(
+    channelOrProvider: InteractionChannel | UserQuestionProvider,
+    explicitProvider?: UserQuestionProvider,
+  ): () => void {
+    const channel = typeof channelOrProvider === 'string' ? channelOrProvider : 'web'
+    const provider = typeof channelOrProvider === 'string' ? explicitProvider : channelOrProvider
+    if (provider === undefined) {
+      throw new UserQuestionError(`user-questions provider for channel ${channel} is missing`, 'INVALID_PROVIDER')
+    }
+    const registration: ProviderRegistration = { provider, disposed: new AbortController() }
     const dispose = this.ctx.effect(function* (this: UserQuestionService) {
-      if (this.provider !== undefined) {
-        throw new UserQuestionError('a user-questions provider is already registered', 'DUPLICATE_PROVIDER')
+      if (this.providers.has(channel)) {
+        throw new UserQuestionError(
+          `a user-questions provider for channel ${channel} is already registered`,
+          'DUPLICATE_PROVIDER')
       }
-      this.provider = provider
+      this.providers.set(channel, registration)
       yield () => {
-        this.provider = undefined
+        if (this.providers.get(channel) !== registration) return
+        this.providers.delete(channel)
+        registration.disposed.abort()
       }
     }.bind(this), 'userInteraction.registerProvider()')
     return () => void dispose()
   }
 
+  private askProvider(
+    registration: ProviderRegistration,
+    request: AskUserQuestionRequest,
+  ): Promise<AskUserQuestionAnswer> {
+    const callerSignal = request.signal
+    const providerSignal = registration.disposed.signal
+    const signal = callerSignal === undefined
+      ? providerSignal
+      : AbortSignal.any([callerSignal, providerSignal])
+    return new Promise<AskUserQuestionAnswer>((resolve, reject) => {
+      let settled = false
+      const finish = (operation: () => void): void => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener('abort', onAbort)
+        operation()
+      }
+      const onAbort = (): void => {
+        finish(() => {
+          reject(providerSignal.aborted
+            ? new UserQuestionError('the selected user-questions provider was disposed', 'PROVIDER_DISPOSED')
+            : new UserQuestionError('ask_user_question was aborted before the user answered', 'ASK_ABORTED'))
+        })
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      Promise.resolve()
+        .then(() => registration.provider.ask({ ...request, signal }))
+        .then(
+          (answer) => {
+            finish(() => {
+              resolve(answer)
+            })
+          },
+          (error: unknown) => {
+            finish(() => {
+              reject(error instanceof Error
+                ? error
+                : new UserQuestionError('the selected user-questions provider failed', 'PROVIDER_FAILED', { cause: error }))
+            })
+          },
+        )
+    })
+  }
+
   /**
-   * Ask the active UI provider and wait for the user's answer.
+   * Ask the provider selected by the trusted route and wait for the user's answer.
    *
    * When a caller supplies an agent, human interaction is valid only for the
    * exact live runtime root. Runtime ownership, not durable session lineage,
@@ -133,10 +237,17 @@ export class UserQuestionService extends Service {
           'BAD_INTENT')
       }
     }
-    if (this.provider === undefined) {
-      throw new UserQuestionError('no user-questions provider is registered', 'NO_PROVIDER')
+    const channel = request.route?.channel ?? 'web'
+    const registration = this.providers.get(channel)
+    if (registration === undefined) {
+      if (request.route !== undefined) {
+        throw new UserQuestionError(
+          `no user-questions provider is registered for route ${channel}`,
+          'NO_PROVIDER_FOR_ROUTE')
+      }
+      throw new UserQuestionError('no default Web user-questions provider is registered', 'NO_PROVIDER')
     }
-    return this.provider.ask(request)
+    return this.askProvider(registration, request)
   }
 }
 

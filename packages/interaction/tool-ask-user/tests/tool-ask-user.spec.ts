@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { CallId } from '@deepseek-ai/dsh-llm'
-import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import { CallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import AgentRegistry, { agentEvents, type Agent } from '@deepseek-ai/dsh-agent'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
-import UserQuestionService, { type AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
+import UserQuestionService, { routeUserMessage, type AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import * as toolAskUser from '@deepseek-ai/dsh-tool-ask-user'
 
 const testToolSignal = new AbortController().signal
@@ -213,7 +213,8 @@ describe('ask_user_question tool', () => {
       signal: controller.signal,
     })
 
-    expect(seen[0]?.signal).toBe(controller.signal)
+    expect(seen[0]?.signal).not.toBe(controller.signal)
+    expect(seen[0]?.signal?.aborted).toBe(false)
   })
 
   it('passes optional header and a resumed runtime root through to the user-questions request', async () => {
@@ -238,6 +239,46 @@ describe('ask_user_question tool', () => {
 
     expect(result.content).toEqual([{ type: 'text', text: '{"answers":[{"id":"continue","selected":["ok"]}]}' }])
     expect(seen[0]).toMatchObject({ questions: [{ id: 'continue', header: 'Confirm', question: 'Continue?' }], agent })
+  })
+
+  it('copies the trusted route from the message that opened the current turn', async () => {
+    const ctx = await setup()
+    const seen: AskUserQuestionRequest[] = []
+    ctx.userQuestions.registerProvider('wecom', {
+      async ask(request) {
+        seen.push(request)
+        return { answers: [{ id: 'continue', selected: ['ok'] }] }
+      },
+    })
+    const agent = stubAgent('routed-root')
+    ctx.agents.enter(agent, undefined)
+    const historical = routeUserMessage(createUserMessage({
+      content: [{ type: 'text', text: 'historical turn' }], source: { kind: 'user' },
+    }), { channel: 'web', destination: 'historical-session' })
+    const first = routeUserMessage(createUserMessage({
+      content: [{ type: 'text', text: 'first' }], source: { kind: 'user' },
+    }), { channel: 'wecom', destination: 'single:user-1' })
+    const later = routeUserMessage(createUserMessage({
+      content: [{ type: 'text', text: 'later steering' }], source: { kind: 'user' },
+    }), { channel: 'web', destination: 'session-other' })
+    await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step', { messages: [historical, first], turn: 1, step: 1, signal: testToolSignal },
+      async () => ({ kind: 'enter', messages: [historical, first] }),
+    )
+    await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step', { messages: [historical, first, later], turn: 1, step: 2, signal: testToolSignal },
+      async () => ({ kind: 'enter', messages: [historical, first, later] }),
+    )
+
+    await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('ask-routed'),
+      name: 'ask_user_question',
+      arguments: { questions: [{ id: 'continue', question: 'Continue?' }] },
+      agent,
+    })
+
+    expect(seen[0]?.route).toEqual({ channel: 'wecom', destination: 'single:user-1' })
   })
 
   it('returns structured user-questions errors through tool execution', async () => {

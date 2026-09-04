@@ -70,6 +70,17 @@ function answer(
 }
 
 describe('question response validation', () => {
+  it('rejects a Web route whose destination is not the exact calling session', async () => {
+    const { ctx } = await harness()
+    const live = agent(ctx)
+
+    await expect(ctx.userQuestions.ask({
+      agent: live,
+      questions: [{ id: 'route', question: 'Continue?' }],
+      route: { channel: 'web', destination: 'session-other' },
+    })).rejects.toMatchObject({ code: 'ROUTE_MISMATCH' })
+  })
+
   it('accepts selected options with custom text for multi-select questions', async () => {
     const { ctx, api } = await harness()
     const abort = new AbortController()

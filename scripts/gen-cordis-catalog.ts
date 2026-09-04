@@ -450,6 +450,8 @@ export const LINK_MAP: Readonly<Record<string, string>> = {
   ResolvedCredential: 'credentials.md',
   AskUserQuestionAnswer: 'user-questions.md',
   AskUserQuestionRequest: 'user-questions.md',
+  InteractionChannel: 'user-questions.md',
+  InteractionRoute: 'user-questions.md',
   UserQuestionProvider: 'user-questions.md',
   WebFetchProvider: 'web.md',
   WebFetchRequest: 'web.md',

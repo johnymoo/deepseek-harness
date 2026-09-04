@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import UserQuestionService, {
+  interactionRouteOf,
+  routeUserMessage,
   UserQuestionError,
   type AskUserQuestionRequest,
   type UserQuestionProvider,
@@ -27,6 +30,16 @@ function stubAgent(id: string, delegationDepth = 0): Agent {
 }
 
 describe('UserQuestionService', () => {
+  it('keeps trusted routes process-local and out of serialized messages', () => {
+    const message = routeUserMessage(createUserMessage({
+      content: [{ type: 'text', text: 'hello' }],
+      source: { kind: 'user' },
+    }), { channel: 'wecom', destination: 'single:secret-user' })
+
+    expect(interactionRouteOf(message)).toEqual({ channel: 'wecom', destination: 'single:secret-user' })
+    expect(JSON.stringify(message)).not.toContain('single:secret-user')
+  })
+
   it('delegates ask requests to the registered provider', async () => {
     const ctx = new Context()
     await ctx.plugin(UserQuestionService)
@@ -36,7 +49,7 @@ describe('UserQuestionService', () => {
     const result = await ctx.userQuestions.ask({ questions: [{ id: 'confirm', question: 'Proceed?' }] })
 
     expect(result).toEqual({ answers: [{ id: 'confirm', selected: ['yes'] }] })
-    expect(p.seen).toEqual([{ questions: [{ id: 'confirm', question: 'Proceed?' }] }])
+    expect(p.seen).toMatchObject([{ questions: [{ id: 'confirm', question: 'Proceed?' }] }])
   })
 
   it('rejects ask requests when no provider is registered', async () => {
@@ -67,6 +80,69 @@ describe('UserQuestionService', () => {
 
     expect(() => ctx.userQuestions.registerProvider(provider('second')))
       .toThrow(UserQuestionError)
+  })
+
+  it('normalizes non-Error provider failures', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- exercises a hostile provider boundary.
+    ctx.userQuestions.registerProvider({ ask: () => Promise.reject('broken provider') })
+
+    await expect(ctx.userQuestions.ask({ questions: [{ id: 'confirm', question: 'Proceed?' }] }))
+      .rejects.toMatchObject({ name: 'UserQuestionError', code: 'PROVIDER_FAILED', cause: 'broken provider' })
+  })
+
+  it('routes Web and WeCom requests to concurrent channel providers', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const web = provider('web-answer')
+    const wecom = provider('wecom-answer')
+    ctx.userQuestions.registerProvider('web', web)
+    ctx.userQuestions.registerProvider('wecom', wecom)
+
+    await expect(ctx.userQuestions.ask({
+      questions: [{ id: 'route', question: 'Where?' }],
+      route: { channel: 'wecom', destination: 'single:user-1' },
+    })).resolves.toEqual({ answers: [{ id: 'route', selected: ['wecom-answer'] }] })
+    await expect(ctx.userQuestions.ask({
+      questions: [{ id: 'route', question: 'Where?' }],
+      route: { channel: 'web', destination: 'session-1' },
+    })).resolves.toEqual({ answers: [{ id: 'route', selected: ['web-answer'] }] })
+    expect(web.seen).toHaveLength(1)
+    expect(wecom.seen).toHaveLength(1)
+  })
+
+  it('defaults legacy route-less asks to Web and never falls back explicit routes', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const web = provider('web-answer')
+    ctx.userQuestions.registerProvider(web)
+
+    await expect(ctx.userQuestions.ask({ questions: [{ id: 'legacy', question: 'Continue?' }] }))
+      .resolves.toEqual({ answers: [{ id: 'legacy', selected: ['web-answer'] }] })
+    await expect(ctx.userQuestions.ask({
+      questions: [{ id: 'explicit', question: 'Continue?' }],
+      route: { channel: 'wecom', destination: 'single:user-1' },
+    })).rejects.toMatchObject({ code: 'NO_PROVIDER_FOR_ROUTE' })
+    expect(web.seen).toHaveLength(1)
+  })
+
+  it('aborts only the disposed provider pending asks', async () => {
+    const ctx = new Context()
+    await ctx.plugin(UserQuestionService)
+    const never = (): UserQuestionProvider => ({ ask: () => new Promise(() => undefined) })
+    const disposeWecom = ctx.userQuestions.registerProvider('wecom', never())
+    ctx.userQuestions.registerProvider('web', provider('web-answer'))
+    const pending = ctx.userQuestions.ask({
+      questions: [{ id: 'pending', question: 'Continue?' }],
+      route: { channel: 'wecom', destination: 'single:user-1' },
+    })
+
+    disposeWecom()
+
+    await expect(pending).rejects.toMatchObject({ code: 'PROVIDER_DISPOSED' })
+    await expect(ctx.userQuestions.ask({ questions: [{ id: 'web', question: 'Continue?' }] }))
+      .resolves.toMatchObject({ answers: [{ selected: ['web-answer'] }] })
   })
 
   it('fails before reaching the provider when the signal is already aborted', async () => {

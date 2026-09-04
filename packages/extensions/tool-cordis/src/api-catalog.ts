@@ -2005,18 +2005,29 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
   },
   {
     key: 'userQuestions',
-    summary: '`ctx.userQuestions`: one active UI provider plus an `ask()` API.',
-    description: '`ctx.userQuestions`: one active UI provider plus an `ask()` API.',
+    summary: '`ctx.userQuestions`: channel providers plus a route-aware `ask()` API.',
+    description: '`ctx.userQuestions`: channel providers plus a route-aware `ask()` API.',
     methods: [
       {
+        signature: 'readonly supportsRouting: true = true',
+        description: 'Feature probe used by optional out-of-tree providers.',
+        parameters: [],
+      },
+      {
         signature: 'registerProvider(provider: UserQuestionProvider): () => void',
-        description: 'Register the UI provider. Only one provider may be active in a context.',
+        description: 'Register the legacy/default Web provider.',
         parameters: [{ name: 'provider', description: 'UI-side implementation that collects answers.' }],
         returns: 'Disposer that unregisters this provider.',
       },
       {
+        signature: 'registerProvider(channel: InteractionChannel, provider: UserQuestionProvider): () => void',
+        description: 'Register one channel provider.',
+        parameters: [{ name: 'channel', description: 'Trusted route channel owned by this provider.' }, { name: 'provider', description: 'UI-side implementation that collects answers.' }],
+        returns: 'Disposer that unregisters this provider and aborts its pending asks.',
+      },
+      {
         signature: 'async ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer>',
-        description: 'Ask the active UI provider and wait for the user\'s answer.\n\nWhen a caller supplies an agent, human interaction is valid only for the exact live runtime root. Runtime ownership, not durable session lineage, decides this boundary: an owned child has no human answerer and would block forever, while a lineage-bearing session resumed as a new runtime root may ask normally.',
+        description: 'Ask the provider selected by the trusted route and wait for the user\'s answer.\n\nWhen a caller supplies an agent, human interaction is valid only for the exact live runtime root. Runtime ownership, not durable session lineage, decides this boundary: an owned child has no human answerer and would block forever, while a lineage-bearing session resumed as a new runtime root may ask normally.',
         parameters: [{ name: 'request', description: 'Questions, owner agent, and abort signal.' }],
         returns: 'The answer chosen or typed by the human.',
         throws: ['{UserQuestionError} code `CALLER_NOT_LIVE` when a supplied agent is not the registry\'s exact live instance, or `DELEGATED_CALLER` when that live agent is owned by another agent.'],
@@ -2687,7 +2698,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'AskUserQuestionRequest',
-    declaration: 'export interface AskUserQuestionRequest {\n    questions: AskUserQuestionItem[];\n    agent?: Agent;\n    signal?: AbortSignal;\n}',
+    declaration: 'export interface AskUserQuestionRequest {\n    questions: AskUserQuestionItem[];\n    agent?: Agent;\n    signal?: AbortSignal;\n    route?: InteractionRoute;\n}',
   },
   {
     name: 'AssembleContext',
@@ -3156,6 +3167,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'InboxTarget',
     declaration: 'export type InboxTarget = \'next-turn\' | \'next-step\';',
+  },
+  {
+    name: 'InteractionChannel',
+    declaration: 'export type InteractionChannel = InteractionRoute[\'channel\'];',
+  },
+  {
+    name: 'InteractionRoute',
+    declaration: 'export type InteractionRoute = {\n    readonly channel: \'web\';\n    readonly destination: string;\n} | {\n    readonly channel: \'wecom\';\n    readonly destination: string;\n};',
   },
   {
     name: 'InvariantFailure',

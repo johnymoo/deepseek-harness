@@ -7,8 +7,10 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import '@deepseek-ai/dsh-user-questions'
+import type { InteractionRoute } from '@deepseek-ai/dsh-user-questions'
+import { interactionRouteOf } from '@deepseek-ai/dsh-user-questions'
 
 export const name = 'tool-ask-user'
 export const inject = ['tools', 'userQuestions']
@@ -17,6 +19,15 @@ const description = 'Ask the user a concise question when you need confirmation,
   + 'Send one or more questions, each with a stable id that will be echoed in the answer.'
 
 export function apply(ctx: Context): void {
+  const activeRoutes = new WeakMap<Agent, { turn: number; route?: InteractionRoute }>()
+  ctx.on('agent/pre-step', ({ agent, messages, turn }, next) => {
+    if (activeRoutes.get(agent)?.turn !== turn) {
+      const trigger = messages.findLast(message => message.source.kind === 'user')
+      const route = interactionRouteOf(trigger)
+      activeRoutes.set(agent, route === undefined ? { turn } : { turn, route })
+    }
+    return next()
+  })
   ctx.tools.register(defineTool({
     name: 'ask_user_question',
     description,
@@ -78,6 +89,7 @@ export function apply(ctx: Context): void {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(args, exec) {
+      const route = exec.agent === undefined ? undefined : activeRoutes.get(exec.agent)?.route
       const result = await ctx.userQuestions.ask({
         questions: args.questions.map(question => ({
           id: question.id,
@@ -87,6 +99,7 @@ export function apply(ctx: Context): void {
           ...question.multi_select !== undefined ? { multiSelect: question.multi_select } : {},
         })),
         ...exec.agent !== undefined ? { agent: exec.agent } : {},
+        ...route === undefined ? {} : { route },
         signal: exec.signal,
       })
       return {

@@ -145,11 +145,11 @@ Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnp
 
 ### `ctx.userQuestions` — `UserQuestionService`
 
-`ctx.userQuestions`: one active UI provider plus an `ask()` API.
+`ctx.userQuestions`: channel providers plus a route-aware `ask()` API.
 
 ```ts cordis-catalog
 /**
- * Register the UI provider. Only one provider may be active in a context.
+ * Register the legacy/default Web provider.
  *
  * @param provider UI-side implementation that collects answers.
  * @returns Disposer that unregisters this provider.
@@ -157,7 +157,16 @@ Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnp
 registerProvider(provider: UserQuestionProvider): () => void
 
 /**
- * Ask the active UI provider and wait for the user's answer.
+ * Register one channel provider.
+ *
+ * @param channel Trusted route channel owned by this provider.
+ * @param provider UI-side implementation that collects answers.
+ * @returns Disposer that unregisters this provider and aborts its pending asks.
+ */
+registerProvider(channel: InteractionChannel, provider: UserQuestionProvider): () => void
+
+/**
+ * Ask the provider selected by the trusted route and wait for the user's answer.
  *
  * When a caller supplies an agent, human interaction is valid only for the
  * exact live runtime root. Runtime ownership, not durable session lineage,
@@ -174,5 +183,5 @@ registerProvider(provider: UserQuestionProvider): () => void
 async ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer>
 ```
 
-Source: [`packages/interaction/user-questions/src/index.ts:51`](../../packages/interaction/user-questions/src/index.ts)
+Source: [`packages/interaction/user-questions/src/index.ts:87`](../../packages/interaction/user-questions/src/index.ts)
 <!-- END GENERATED cordis-surface -->

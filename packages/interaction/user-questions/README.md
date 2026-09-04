@@ -8,17 +8,19 @@ User-interaction Service Definition. It owns `ctx.userQuestions`, the service a 
 
 ### Public API
 
-- `ctx.userQuestions.registerProvider(provider): () => void` Register the UI-side provider. Only one provider may be active in a context; disposal unregisters it.
-- `ctx.userQuestions.ask(request): Promise<AskUserQuestionAnswer>` Ask the active provider and wait for the answer.
+- `ctx.userQuestions.registerProvider(provider): () => void` Register the legacy/default Web provider.
+- `ctx.userQuestions.registerProvider(channel, provider): () => void` Register one Web or WeCom provider; disposal unregisters that channel and aborts its pending asks.
+- `ctx.userQuestions.ask(request): Promise<AskUserQuestionAnswer>` Ask the provider selected by the trusted route and wait for the answer.
 
 ### Key Types
 
-- `AskUserQuestionRequest` — `{ questions: [{ id, question, detail?, header?, options?, multiSelect?, intent? }], agent?, signal? }`; `detail` supplies supporting text that providers render with the question without turning it into an option label. When present, `agent` must be the registry's exact live runtime root.
+- `AskUserQuestionRequest` — `{ questions: [{ id, question, detail?, header?, options?, multiSelect?, intent? }], agent?, signal?, route? }`; `route` is host-authored and never part of the model tool schema. When present, `agent` must be the registry's exact live runtime root.
+- `InteractionRoute` — `{ channel: 'web' | 'wecom', destination }`, frozen by the host on the message that opens the turn.
 - `AskUserQuestionOption` — `{ label, description? }`.
 - `AskUserQuestionIntent` — `{ kind: 'plan-review', approve }`; the tagged presentation intent below.
 - `AskUserQuestionAnswer` — `{ answers: [{ id, selected, custom? }] }`.
 - `UserQuestionProvider` — UI implementation with `ask(request)`.
-- `UserQuestionError` — `HarnessError` subclass with codes such as `EMPTY_QUESTIONS`, `BAD_INTENT`, `NO_PROVIDER`, `DUPLICATE_PROVIDER`, `ASK_ABORTED`, `CALLER_NOT_LIVE`, and `DELEGATED_CALLER`.
+- `UserQuestionError` — `HarnessError` subclass with codes such as `EMPTY_QUESTIONS`, `BAD_INTENT`, `NO_PROVIDER`, `NO_PROVIDER_FOR_ROUTE`, `DUPLICATE_PROVIDER`, `PROVIDER_DISPOSED`, `ASK_ABORTED`, `CALLER_NOT_LIVE`, and `DELEGATED_CALLER`.
 
 For a single-select question, `custom` overrides the selected choice and `selected` is empty. For a multi-select question, `custom` may supplement the labels in `selected`. A UI may preserve a skipped item as `{ id, selected: [] }`, keeping the existing answer shape while retaining other answers in the batch.
 
@@ -40,7 +42,8 @@ Indirectly, through `dsh-tool-ask-user`, which retains a successful provider ans
 
 No direct invalidation; the named consumer owns any request-prefix changes.
 
+Route-less requests select Web for compatibility. Explicit routes never fall back to another channel: a missing provider fails with `NO_PROVIDER_FOR_ROUTE`. Duplicate registration is rejected per channel, so Web and WeCom may coexist while two Web providers may not.
+
 ## Known Limitations and Deferred Work
 
-- **One provider per context** — there is no routing or fan-out to multiple UIs; a second registration throws `DUPLICATE_PROVIDER`, and with none registered `ask()` throws `NO_PROVIDER` rather than degrading.
 - **The vocabulary is the question-form shape only** — selectable options plus optional custom text; richer interaction shapes (file pickers, diff-preview confirmations) have no seam vocabulary yet.

@@ -8,17 +8,19 @@
 
 ### 公开 API
 
-- `ctx.userQuestions.registerProvider(provider): () => void` 注册 UI 侧提供方。同一上下文中只能有一个活跃提供方；dispose（资源释放）会将其注销。
-- `ctx.userQuestions.ask(request): Promise<AskUserQuestionAnswer>` 向活跃提供方提问并等待回答。
+- `ctx.userQuestions.registerProvider(provider): () => void` 注册兼容旧调用的默认 Web 提供方。
+- `ctx.userQuestions.registerProvider(channel, provider): () => void` 注册一个 Web 或企微提供方；dispose 会注销该渠道并中止其待回答问题。
+- `ctx.userQuestions.ask(request): Promise<AskUserQuestionAnswer>` 向可信路由选中的提供方提问并等待回答。
 
 ### 关键类型
 
-- `AskUserQuestionRequest`：`{ questions: [{ id, question, detail?, header?, options?, multiSelect?, intent? }], agent?, signal? }`；`detail` 提供辅助文本，提供方会将其随问题一起渲染，而不会将其变成选项标签。如提供 `agent`，它必须与注册表中的存活运行时根 agent（智能体）是同一对象。
+- `AskUserQuestionRequest`：`{ questions: [{ id, question, detail?, header?, options?, multiSelect?, intent? }], agent?, signal?, route? }`；`route` 由宿主写入，不会出现在模型工具 schema 中。如提供 `agent`，它必须与注册表中的存活运行时根 agent 是同一对象。
+- `InteractionRoute`：`{ channel: 'web' | 'wecom', destination }`，由宿主冻结在开启当前 turn 的消息上。
 - `AskUserQuestionOption`：`{ label, description? }`。
 - `AskUserQuestionIntent`：`{ kind: 'plan-review', approve }`；即下文的带标签呈现意图。
 - `AskUserQuestionAnswer`：`{ answers: [{ id, selected, custom? }] }`。
 - `UserQuestionProvider`：包含 `ask(request)` 的 UI 实现。
-- `UserQuestionError`：`HarnessError` 的子类，包含 `EMPTY_QUESTIONS`、`BAD_INTENT`、`NO_PROVIDER`、`DUPLICATE_PROVIDER`、`ASK_ABORTED`、`CALLER_NOT_LIVE` 和 `DELEGATED_CALLER` 等代码。
+- `UserQuestionError`：`HarnessError` 的子类，包含 `EMPTY_QUESTIONS`、`BAD_INTENT`、`NO_PROVIDER`、`NO_PROVIDER_FOR_ROUTE`、`DUPLICATE_PROVIDER`、`PROVIDER_DISPOSED`、`ASK_ABORTED`、`CALLER_NOT_LIVE` 和 `DELEGATED_CALLER` 等代码。
 
 对于单选题，`custom` 会覆盖选中的选项，且 `selected` 为空。对于多选题，`custom` 可以补充 `selected` 中的标签。UI 可以把跳过的条目保留为 `{ id, selected: [] }`，既维持现有回答形态，也保留该批次中的其他回答。
 
@@ -40,7 +42,8 @@
 
 不会直接使 KV Cache 失效；请求前缀的任何变更均由上述消费方负责。
 
+无路由的旧请求默认选择 Web。显式路由绝不会回退到其他渠道；缺少对应提供方时以 `NO_PROVIDER_FOR_ROUTE` 失败。重复注册按渠道判定，因此 Web 与企微可以并存，但两个 Web 提供方不能并存。
+
 ## 已知限制与暂缓事项
 
-- **每个上下文只能有一个提供方**：不支持路由或扇出到多个 UI；第二次注册会抛出 `DUPLICATE_PROVIDER`，未注册任何提供方时，`ask()` 会抛出 `NO_PROVIDER`，而不会降级。
 - **词汇仅包含问题表单形态**：可供选择的选项加可选的自定义文本；更丰富的交互形态（文件选择器、diff 预览确认）尚无 seam 词汇。

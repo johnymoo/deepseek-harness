@@ -95,9 +95,9 @@ import { questionResponsePayloadSchema } from './api/questions.schema.ts'
 import type { ClientResponse, RpcError, RpcReceipt, RpcRequest, RpcResponse } from './api/rpc.ts'
 import { RpcId } from './api/rpc.ts'
 import type {
-  AskUserQuestionAnswer, AskUserQuestionItem, AskUserQuestionRequest,
+  AskUserQuestionAnswer, AskUserQuestionItem, AskUserQuestionRequest, InteractionRoute,
 } from '@deepseek-ai/dsh-user-questions'
-import { UserQuestionError } from '@deepseek-ai/dsh-user-questions'
+import { routeUserMessage, UserQuestionError } from '@deepseek-ai/dsh-user-questions'
 import { DirectoryPickerError } from '@deepseek-ai/dsh-host-directory-picker'
 import {
   ApiRemoteSessionNotFound as SessionNotFound,
@@ -1366,12 +1366,17 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     })
   }
 
-  const disposeProvider = ctx.userQuestions.registerProvider({
+  const disposeProvider = ctx.userQuestions.registerProvider('web', {
     ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> {
       const sessionId = request.agent?.id
       if (sessionId === undefined) {
         return Promise.reject(new UserQuestionError(
           'web user interaction requires an agent-owned session', 'ASK_MISSING_AGENT'))
+      }
+      if (request.route !== undefined
+        && (request.route.channel !== 'web' || request.route.destination !== sessionId)) {
+        return Promise.reject(new UserQuestionError(
+          'web user interaction route does not match the exact calling session', 'ROUTE_MISMATCH'))
       }
       return new Promise<AskUserQuestionAnswer>((resolve, reject) => {
         const rpcId = RpcId(randomUUID())
@@ -2494,7 +2499,11 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
               }
             }
             const durable = await durablePromptContent(ctx, content)
-            const message: UserMessage = createUserMessage({ content: durable, source })
+            const interactionRoute: InteractionRoute = { channel: 'web', destination: sessionId }
+            const message: UserMessage = routeUserMessage(
+              createUserMessage({ content: durable, source }),
+              interactionRoute,
+            )
             if (mode === 'steer') agent.steer(message)
             else agent.followup(message)
           } catch (error: unknown) {
