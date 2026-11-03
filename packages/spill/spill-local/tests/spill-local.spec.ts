@@ -161,6 +161,27 @@ describe('LocalSpillStore service', () => {
     expect((ctx.spillStore as LocalSpillStore).root).toBe(privateRoot())
   })
 
+  it('defers the default root to the first spill (no temp dir at construction)', async () => {
+    class Probe extends LocalSpillStore {
+      pendingRoot(): string | undefined { return this.defaultRoot }
+    }
+    const ctx = new Context()
+    await ctx.plugin(Probe, { cleanupPeriodDays: 0 })
+    const store = ctx.spillStore as Probe
+    // Nothing created yet: a boot that never spills leaves no `dsh-spill-*` behind.
+    expect(store.pendingRoot()).toBeUndefined()
+    const ref = await ctx.spillStore.saveText(request())
+    expect(store.pendingRoot()).toBe(privateRoot())
+    expect(dirname(ref.locator)).toBe(sessionDir(store.pendingRoot()!, 'sess-1'))
+    expect(existsSync(store.pendingRoot()!)).toBe(true)
+  })
+
+  it('sweeps with no active root while the default is still uncreated', async () => {
+    // `undefined` (lazy default not yet created) gathers only discovered roots —
+    // same contract as a missing configured path, and never a crash.
+    expect(await gatherSweepRoots(undefined, () => {}, root)).toEqual([])
+  })
+
   it('rejects when the root is not writable (missing parent, exclusive open)', async () => {
     const ctx = new Context()
     // A file (not a dir) as the root makes mkdir under it fail — a real storage error.

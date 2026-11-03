@@ -68,11 +68,14 @@ export class LocalSpillStore extends SpillStore {
     cleanupPeriodDays: z.number().step(1).min(0).default(30),
   })
 
-  /** Resolved absolute spill root (config `root`, else the private default), fixed at construction. */
-  readonly root: string
-
   /** Validated config (schemastery applied the `cleanupPeriodDays` default before construction). */
   readonly config: ResolvedConfig
+
+  /** The configured root resolved to an absolute path; `undefined` when the private default backs this store. */
+  protected readonly configuredRoot: string | undefined
+
+  /** The private default root, created on first use — never at construction. */
+  protected defaultRoot: string | undefined
 
   /**
    * The in-flight (or settled) startup cleanup sweep. Held so disposal can await
@@ -80,12 +83,23 @@ export class LocalSpillStore extends SpillStore {
    */
   private cleanup: Promise<void> | undefined
 
+  /**
+   * The resolved absolute spill root: the configured `root` when given, else the
+   * private default. The default is created on first access (in practice the
+   * first spill), NOT at construction — a process that boots and exits without
+   * ever spilling (a short CLI run, a crash loop iteration) must not litter the
+   * temp dir with an empty `dsh-spill-*` root.
+   */
+  get root(): string {
+    return this.configuredRoot ?? (this.defaultRoot ??= privateRoot())
+  }
+
   constructor(ctx: Context, config: Config) {
     super(ctx)
     // schemastery (static Config) has already filled `cleanupPeriodDays`; the
     // cast records that runtime fact for exactOptionalPropertyTypes.
     this.config = config as ResolvedConfig
-    this.root = config.root !== undefined ? resolve(config.root) : privateRoot()
+    this.configuredRoot = config.root !== undefined ? resolve(config.root) : undefined
 
     // One best-effort startup sweep, owned by the fiber. The generator body runs
     // at activation but does NOT await the sweep — it launches it and yields an
@@ -131,7 +145,7 @@ export class LocalSpillStore extends SpillStore {
    * @returns The roots to sweep, each flagged for prune-when-empty.
    */
   protected async gatherRoots(warn: WarnFn): Promise<SweepRoot[]> {
-    return gatherSweepRoots(this.root, warn, this.defaultRootsBase())
+    return gatherSweepRoots(this.configuredRoot ?? this.defaultRoot, warn, this.defaultRootsBase())
   }
 
   /**
