@@ -408,21 +408,23 @@ export async function discoverDefaultRoots(warn: WarnFn, base: string = tmpdir()
 /**
  * Gather and de-duplicate the trusted roots for one startup sweep. The active
  * configured path may be a symlink; its resolved identity overrides a matching
- * discovered root so the live target is never marked prunable.
+ * discovered root so the live target is never marked prunable. `undefined` means
+ * the active root is a default root that has not been created yet (no spill this
+ * process) — only the discovered prior defaults are returned.
  *
- * @param activeRoot Active configured root.
+ * @param activeRoot Active configured root, or `undefined` when absent/uncreated.
  * @param warn Sink for contained inspection failures.
  * @param defaultRootsBase Directory holding prior default roots.
  * @returns Trusted roots with the active identity marked non-prunable.
  */
 export async function gatherSweepRoots(
-  activeRoot: string,
+  activeRoot: string | undefined,
   warn: WarnFn,
   defaultRootsBase: string = tmpdir(),
 ): Promise<SweepRoot[]> {
   const [discovered, active] = await Promise.all([
     discoverDefaultRootRecords(warn, defaultRootsBase),
-    resolveRoot(activeRoot, true, warn),
+    activeRoot === undefined ? Promise.resolve(undefined) : resolveRoot(activeRoot, true, warn),
   ])
   const roots = new Map<string, SweepRoot>()
   for (const root of discovered) roots.set(root.identity, { path: root.path, pruneWhenEmpty: true })
